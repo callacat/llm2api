@@ -11,8 +11,10 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime/multipart"
 	"net"
 	"net/http"
+	"net/textproto"
 	"os"
 	"regexp"
 	"sort"
@@ -500,13 +502,14 @@ type ttfbReadCloser struct {
 	clientAPI  string
 	keySlot    string
 	proxyLabel string
+	ip         string
 }
 
 func (r *ttfbReadCloser) Read(p []byte) (int, error) {
 	n, err := r.inner.Read(p)
 	r.once.Do(func() {
 		ttfb := time.Since(r.start)
-		log.Printf("[ttfb] api=%s upstream=%s model=%s key=%s proxy=%s ttfb=%s", r.clientAPI, r.upstream, r.model, r.keySlot, r.proxyLabel, ttfb.Round(time.Millisecond))
+		log.Printf("[ttfb] api=%s ip=%s upstream=%s model=%s key=%s proxy=%s ttfb=%s", r.clientAPI, r.ip, r.upstream, r.model, r.keySlot, r.proxyLabel, ttfb.Round(time.Millisecond))
 	})
 	return n, err
 }
@@ -682,6 +685,59 @@ var (
 	debugMode          bool
 	configMu           sync.RWMutex
 )
+
+// ======================== 客户端来源 IP ========================
+
+// clientIPKey 是 context 中携带客户端来源 IP 的私有键。
+type clientIPKey struct{}
+
+// withClientIP 把已解析的来源 IP 写入 context，供下游转发/日志复用。
+func withClientIP(ctx context.Context, ip string) context.Context {
+	return context.WithValue(ctx, clientIPKey{}, ip)
+}
+
+// clientIPFromContext 读取 context 中的来源 IP；缺失时返回 "-"。
+func clientIPFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return "-"
+	}
+	if v, ok := ctx.Value(clientIPKey{}).(string); ok && v != "" {
+		return v
+	}
+	return "-"
+}
+
+// clientIP 解析请求的真实来源 IP。
+// 本站通过 Cloudflare 反代，优先取 Cloudflare 写入的来源头（CF-Connecting-IP、
+// True-Client-IP），其次 X-Real-IP 与 X-Forwarded-For 链首地址；
+// 都没有时回退到 TCP 层的 RemoteAddr（形如 1.2.3.4:5678，含端口）。
+// 注意：CF 头仅在请求确实经由 Cloudflare 时可信；若源站可被直连，
+// 客户端可伪造这些头，建议用防火墙限制源站只接受 Cloudflare 回源网段。
+func clientIP(r *http.Request) string {
+	if r == nil {
+		return "-"
+	}
+	if v := strings.TrimSpace(r.Header.Get("CF-Connecting-IP")); v != "" {
+		return v
+	}
+	if v := strings.TrimSpace(r.Header.Get("True-Client-IP")); v != "" {
+		return v
+	}
+	if v := strings.TrimSpace(r.Header.Get("X-Real-IP")); v != "" {
+		return v
+	}
+	if v := r.Header.Get("X-Forwarded-For"); v != "" {
+		for _, part := range strings.Split(v, ",") {
+			if ip := strings.TrimSpace(part); ip != "" {
+				return ip
+			}
+		}
+	}
+	if v := strings.TrimSpace(r.RemoteAddr); v != "" {
+		return v
+	}
+	return "-"
+}
 
 // ======================== 管理面板认证 ========================
 
@@ -2816,17 +2872,110 @@ func getUpstreamEndpoint(upstream *UpstreamConfig) string {
 	}
 }
 
-func buildUpstreamRequest(endpoint, apiKey string, body []byte, upstream *UpstreamConfig) (*http.Request, error) {
+// getUpstreamImagesEndpoint 返回上游的图片生成端点。
+// OpenAI 兼容上游走 /images/generations；Anthropic / Responses 型上游
+// 没有标准图像生成端点，无法转发，返回空字符串。
+func getUpstreamImagesEndpoint(upstream *UpstreamConfig) string {
+	if upstream == nil || upstream.BaseURL == "" {
+		return ""
+	}
+	switch upstream.APIType {
+	case UpstreamOpenAI:
+		return strings.TrimRight(upstream.BaseURL, "/") + "/images/generations"
+	default:
+		return ""
+	}
+}
+
+// getUpstreamImagesEditsEndpoint 返回上游的图片编辑端点（multipart/form-data）。
+// 与 generations 相同，仅 OpenAI 兼容上游支持。
+func getUpstreamImagesEditsEndpoint(upstream *UpstreamConfig) string {
+	if upstream == nil || upstream.BaseURL == "" {
+		return ""
+	}
+	switch upstream.APIType {
+	case UpstreamOpenAI:
+		return strings.TrimRight(upstream.BaseURL, "/") + "/images/edits"
+	default:
+		return ""
+	}
+}
+
+// hopByHopHeaders 是 RFC 7230 §6.1 定义的逐跳头，不能透传给上游。
+// hopConnectHeaders 与之类似（非标准但客户端常发，一并过滤）。
+var hopByHopHeaders = []string{
+	"Connection",
+	"Proxy-Connection",
+	"Keep-Alive",
+	"Proxy-Authenticate",
+	"Proxy-Authorization",
+	"Te",
+	"Trailer",
+	"Transfer-Encoding",
+	"Upgrade",
+}
+
+// copyClientHeaders 把客户端请求中可透传的头复制到上游请求。
+// 不传：认证头（Authorization/x-api-key）、逐跳头、以及由本网关统一管理的
+// Host/Content-Length/Content-Type/Accept。anthropic-version/anthropic-beta
+// 等协议协商头原样透传，客户端不带则不发送。
+func copyClientHeaders(dst http.Header, src http.Header) {
+	if src == nil {
+		return
+	}
+	blocked := map[string]struct{}{
+		"authorization":  {},
+		"x-api-key":      {},
+		"host":           {},
+		"content-length": {},
+		"content-type":   {},
+		"accept":         {},
+	}
+	for _, name := range hopByHopHeaders {
+		blocked[strings.ToLower(name)] = struct{}{}
+	}
+	// Connection 头里点名的头也属于逐跳头，需要一并排除
+	for _, val := range src.Values("Connection") {
+		for _, name := range strings.Split(val, ",") {
+			name = strings.TrimSpace(name)
+			if name != "" {
+				blocked[strings.ToLower(name)] = struct{}{}
+			}
+		}
+	}
+	for key, values := range src {
+		if _, skip := blocked[strings.ToLower(key)]; skip {
+			continue
+		}
+		for _, v := range values {
+			dst.Add(key, v)
+		}
+	}
+}
+
+func buildUpstreamRequest(endpoint, apiKey string, body []byte, upstream *UpstreamConfig, clientHeaders http.Header) (*http.Request, error) {
+	return buildUpstreamRequestCT(endpoint, apiKey, body, upstream, clientHeaders, "application/json")
+}
+
+// buildUpstreamRequestCT 与 buildUpstreamRequest 相同，但允许调用方指定
+// Content-Type（图片编辑等 multipart/form-data 场景需要保留 multipart boundary）。
+// content-type 为空时按 json 处理。
+func buildUpstreamRequestCT(endpoint, apiKey string, body []byte, upstream *UpstreamConfig, clientHeaders http.Header, contentType string) (*http.Request, error) {
 	req, err := http.NewRequest("POST", endpoint, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Content-Type", "application/json")
+	ct := strings.TrimSpace(contentType)
+	if ct == "" {
+		ct = "application/json"
+	}
+	// 先透传客户端可控的头，再用本网关统一管理的头覆盖，
+	// 保证认证与内容协商始终由服务端配置决定。
+	copyClientHeaders(req.Header, clientHeaders)
+	req.Header.Set("Content-Type", ct)
 	if apiKey != "" {
 		if upstream != nil && upstream.APIType == UpstreamAnthropic {
 			req.Header.Set("x-api-key", apiKey)
-			req.Header.Set("anthropic-version", "2023-06-01")
-			req.Header.Set("anthropic-beta", "prompt-caching-2025-01-31")
 		} else {
 			req.Header.Set("Authorization", "Bearer "+apiKey)
 		}
@@ -2854,7 +3003,27 @@ func prepareOpenAIUpstreamBody(reqBody []byte, modelID string, upstream *Upstrea
 	return tryBody, nil
 }
 
-func callPreparedUpstream(ctx context.Context, preparedBody []byte, upstreamName, modelID, clientAPI string, upstream *UpstreamConfig, proxyAddr string, rawResponse ...bool) ([]byte, int, http.Header, error) {
+func callPreparedUpstream(ctx context.Context, preparedBody []byte, upstreamName, modelID, clientAPI string, upstream *UpstreamConfig, proxyAddr string, clientHeaders http.Header, rawResponse ...bool) ([]byte, int, http.Header, error) {
+	return callPreparedUpstreamE(ctx, preparedBody, upstreamName, modelID, clientAPI, upstream, proxyAddr, clientHeaders, getUpstreamEndpoint, rawResponse...)
+}
+
+// callPreparedUpstreamE 与 callPreparedUpstream 相同，但允许调用方指定端点选择函数，
+// 用于图片生成（/images/generations）等需要转发到非 chat/completions 端点的场景。
+// endpointFn 每轮重试都会基于当前 newest upstream 重新计算，配置热更新后同样生效。
+// bodyFn 可注入每轮重试时重建 body / content-type 的夹具（如 multipart 改写）。
+func callPreparedUpstreamE(ctx context.Context, preparedBody []byte, upstreamName, modelID, clientAPI string, upstream *UpstreamConfig, proxyAddr string, clientHeaders http.Header, endpointFn func(*UpstreamConfig) string, rawResponse ...bool) ([]byte, int, http.Header, error) {
+	return callPreparedUpstreamEF(ctx, preparedBody, upstreamName, modelID, clientAPI, upstream, proxyAddr, clientHeaders, endpointFn, nil, rawResponse...)
+}
+
+// bodyFixture 描述每轮请求的 body 重建方式。contentType 为 multipart 等非 json
+// 类型时，buildBody 返回的原始字节直接作为请求体，不再 JSON 序列化。
+type bodyFixture struct {
+	contentType string
+	buildBody   func() ([]byte, error)
+}
+
+// callPreparedUpstreamEF 是 callPreparedUpstreamE 的泛化版，支持 body 夹具。
+func callPreparedUpstreamEF(ctx context.Context, preparedBody []byte, upstreamName, modelID, clientAPI string, upstream *UpstreamConfig, proxyAddr string, clientHeaders http.Header, endpointFn func(*UpstreamConfig) string, fixture *bodyFixture, rawResponse ...bool) ([]byte, int, http.Header, error) {
 	if upstream == nil || upstream.BaseURL == "" {
 		return nil, 500, nil, fmt.Errorf("upstream not configured")
 	}
@@ -2862,14 +3031,28 @@ func callPreparedUpstream(ctx context.Context, preparedBody []byte, upstreamName
 	apiKey, apiKeyIndex, apiKeys := selectUpstreamAPIKey(upstreamName, upstream)
 	retryDelay := 1 * time.Second
 	proxyLabel := modelProxyLabel(proxyAddr)
+	ip := clientIPFromContext(ctx)
 	for {
 		select {
 		case <-ctx.Done():
-			log.Printf("[client disconnect] api=%s upstream=%s model=%s key=%s proxy=%s", clientAPI, effectiveUpstreamName(upstreamName), modelID, formatUpstreamAPIKeySlot(apiKeyIndex, len(apiKeys)), proxyLabel)
+			log.Printf("[client disconnect] api=%s ip=%s upstream=%s model=%s key=%s proxy=%s", clientAPI, ip, effectiveUpstreamName(upstreamName), modelID, formatUpstreamAPIKeySlot(apiKeyIndex, len(apiKeys)), proxyLabel)
 			return nil, 0, nil, ctx.Err()
 		default:
 		}
-		up, err := buildUpstreamRequest(getUpstreamEndpoint(upstream), apiKey, preparedBody, upstream)
+		// body: 每轮重试重建（fixture 可能依赖当前 upstream）
+		reqBody := preparedBody
+		contentType := "application/json"
+		if fixture != nil && fixture.buildBody != nil {
+			rebuilt, err := fixture.buildBody()
+			if err != nil {
+				return nil, 500, nil, err
+			}
+			reqBody = rebuilt
+			if fixture.contentType != "" {
+				contentType = fixture.contentType
+			}
+		}
+		up, err := buildUpstreamRequestCT(endpointFn(upstream), apiKey, reqBody, upstream, clientHeaders, contentType)
 		if err != nil {
 			if err := waitForRetry(ctx, retryDelay); err != nil {
 				return nil, 0, nil, err
@@ -2877,7 +3060,7 @@ func callPreparedUpstream(ctx context.Context, preparedBody []byte, upstreamName
 			// Refresh upstream config on build error too
 			newUpstreamName, newUpstream := resolveUpstream(upstreamName)
 			if newUpstream == nil || newUpstream.BaseURL == "" {
-				log.Printf("[upstream retry abort] api=%s upstream=%s no longer available, giving up", clientAPI, upstreamName)
+				log.Printf("[upstream retry abort] api=%s ip=%s upstream=%s no longer available, giving up", clientAPI, ip, upstreamName)
 				return nil, 500, nil, fmt.Errorf("upstream %q no longer available", upstreamName)
 			}
 			upstreamName, upstream = newUpstreamName, newUpstream
@@ -2887,7 +3070,7 @@ func callPreparedUpstream(ctx context.Context, preparedBody []byte, upstreamName
 		}
 		var c *http.Client
 		c, proxyLabel = getModelHTTPClient(proxyAddr, false)
-		log.Printf("[upstream request] api=%s upstream=%s model=%s key=%s proxy=%s", clientAPI, effectiveUpstreamName(upstreamName), modelID, formatUpstreamAPIKeySlot(apiKeyIndex, len(apiKeys)), proxyLabel)
+		log.Printf("[upstream request] api=%s ip=%s upstream=%s model=%s key=%s proxy=%s", clientAPI, ip, effectiveUpstreamName(upstreamName), modelID, formatUpstreamAPIKeySlot(apiKeyIndex, len(apiKeys)), proxyLabel)
 		startTTFB := time.Now()
 		resp, err := c.Do(up)
 		if err != nil {
@@ -2897,7 +3080,7 @@ func callPreparedUpstream(ctx context.Context, preparedBody []byte, upstreamName
 			// Refresh upstream config on connection error too
 			newUpstreamName, newUpstream := resolveUpstream(upstreamName)
 			if newUpstream == nil || newUpstream.BaseURL == "" {
-				log.Printf("[upstream retry abort] api=%s upstream=%s no longer available, giving up", clientAPI, upstreamName)
+				log.Printf("[upstream retry abort] api=%s ip=%s upstream=%s no longer available, giving up", clientAPI, ip, upstreamName)
 				return nil, 500, nil, fmt.Errorf("upstream %q no longer available", upstreamName)
 			}
 			upstreamName, upstream = newUpstreamName, newUpstream
@@ -2907,7 +3090,7 @@ func callPreparedUpstream(ctx context.Context, preparedBody []byte, upstreamName
 		}
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			ttfb := time.Since(startTTFB)
-			log.Printf("[ttfb] api=%s upstream=%s model=%s key=%s proxy=%s ttfb=%s", clientAPI, effectiveUpstreamName(upstreamName), modelID, formatUpstreamAPIKeySlot(apiKeyIndex, len(apiKeys)), proxyLabel, ttfb.Round(time.Millisecond))
+			log.Printf("[ttfb] api=%s ip=%s upstream=%s model=%s key=%s proxy=%s ttfb=%s", clientAPI, ip, effectiveUpstreamName(upstreamName), modelID, formatUpstreamAPIKeySlot(apiKeyIndex, len(apiKeys)), proxyLabel, ttfb.Round(time.Millisecond))
 			b, readErr := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			if readErr != nil {
@@ -2925,7 +3108,7 @@ func callPreparedUpstream(ctx context.Context, preparedBody []byte, upstreamName
 		errBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if shouldRetryUpstreamStatus(resp.StatusCode) {
-			log.Printf("[upstream retry] api=%s upstream=%s model=%s key=%s proxy=%s status=%d retry_after=%q body=%s", clientAPI, effectiveUpstreamName(upstreamName), modelID, formatUpstreamAPIKeySlot(apiKeyIndex, len(apiKeys)), proxyLabel, resp.StatusCode, resp.Header.Get("Retry-After"), string(errBody))
+			log.Printf("[upstream retry] api=%s ip=%s upstream=%s model=%s key=%s proxy=%s status=%d retry_after=%q body=%s", clientAPI, ip, effectiveUpstreamName(upstreamName), modelID, formatUpstreamAPIKeySlot(apiKeyIndex, len(apiKeys)), proxyLabel, resp.StatusCode, resp.Header.Get("Retry-After"), string(errBody))
 			manyKeys := len(apiKeys) > 1
 			if manyKeys {
 				// 多 key：429/5xx 时立即切到下一把 key 轮询，不退避、不等待
@@ -2939,7 +3122,7 @@ func callPreparedUpstream(ctx context.Context, preparedBody []byte, upstreamName
 			// Refresh upstream config: user may have re-mapped or deleted this upstream
 			newUpstreamName, newUpstream := resolveUpstream(upstreamName)
 			if newUpstream == nil || newUpstream.BaseURL == "" {
-				log.Printf("[upstream retry abort] api=%s upstream=%s no longer available, giving up", clientAPI, upstreamName)
+				log.Printf("[upstream retry abort] api=%s ip=%s upstream=%s no longer available, giving up", clientAPI, ip, upstreamName)
 				return errBody, resp.StatusCode, resp.Header.Clone(), fmt.Errorf("upstream %q no longer available", upstreamName)
 			}
 			upstreamName, upstream = newUpstreamName, newUpstream
@@ -2962,30 +3145,181 @@ func callPreparedUpstream(ctx context.Context, preparedBody []byte, upstreamName
 	}
 }
 
-func callUpstream(ctx context.Context, reqBody []byte, upstreamName, modelID, clientAPI string, upstream *UpstreamConfig, proxyAddr string, rawResponse ...bool) ([]byte, int, http.Header, error) {
+// callImagesUpstream 转发 OpenAI 图片生成请求到上游 /images/generations。
+// 非 OpenAI 类型上游（Anthropic / Responses 等）没有该端点，直接报不支持。
+// 响应整体原样透传（不做任何 JSON 改写），body 按内存读取，复用现有
+// key 轮换 / 退避重试 / socks5 代理体系。
+func callImagesUpstream(ctx context.Context, reqBody []byte, upstreamName, modelID string, upstream *UpstreamConfig, proxyAddr string, clientHeaders http.Header) ([]byte, int, http.Header, error) {
+	if upstream == nil || upstream.BaseURL == "" {
+		return nil, 500, nil, fmt.Errorf("upstream not configured")
+	}
+	if upstream.APIType != UpstreamOpenAI {
+		return nil, http.StatusNotImplemented, nil, fmt.Errorf("upstream %q (api_type=%s) does not support image generation; only openai-type upstreams can serve /v1/images/generations", upstreamName, upstream.APIType)
+	}
+	var bodyMap map[string]any
+	if err := json.Unmarshal(reqBody, &bodyMap); err != nil {
+		return nil, http.StatusBadRequest, nil, fmt.Errorf("invalid request body")
+	}
+	bodyMap["model"] = modelID
+	marshaled, err := json.Marshal(bodyMap)
+	if err != nil {
+		return nil, http.StatusInternalServerError, nil, err
+	}
+	// rawResponse=true: 图片接口的响应结构与 chat 不同，不做 convertResponse 改写
+	return callPreparedUpstreamE(ctx, marshaled, upstreamName, modelID, "images", upstream, proxyAddr, clientHeaders, getUpstreamImagesEndpoint, true)
+}
+
+// callImagesEditsUpstream 转发 OpenAI 图片编辑请求到上游 /images/edits。
+// 与 generations 不同，edits 是 multipart/form-data（含 image/mask 文件字段），
+// 这里把原始 multipart body 中的 model 字段改写为目标模型名后重建 multipart，
+// 其余字段（image、mask、prompt、n、size、response_format 等）原样保留。
+// Content-Type 带上 multipart boundary，响应整体原样透传。
+func callImagesEditsUpstream(ctx context.Context, reqBody []byte, contentType string, upstreamName, modelID string, upstream *UpstreamConfig, proxyAddr string, clientHeaders http.Header) ([]byte, int, http.Header, error) {
+	if upstream == nil || upstream.BaseURL == "" {
+		return nil, 500, nil, fmt.Errorf("upstream not configured")
+	}
+	if upstream.APIType != UpstreamOpenAI {
+		return nil, http.StatusNotImplemented, nil, fmt.Errorf("upstream %q (api_type=%s) does not support image editing; only openai-type upstreams can serve /v1/images/edits", upstreamName, upstream.APIType)
+	}
+	if !strings.HasPrefix(strings.ToLower(contentType), "multipart/form-data") {
+		return nil, http.StatusBadRequest, nil, fmt.Errorf("invalid content type: /v1/images/edits requires multipart/form-data")
+	}
+
+	// 解析 multipart（保留原始字节），替换 model 字段后重建。
+	// 为兼容内存，文件字段也先读入内存（与 chat 的 10MB 限制一致，edits 图片通常远小于此）。
+	origCT := contentType
+	if idx := strings.Index(origCT, ";"); idx >= 0 {
+		origCT = origCT[:idx]
+	}
+	boundary := ""
+	if idx := strings.Index(contentType, "boundary="); idx >= 0 {
+		boundary = strings.Trim(strings.TrimSpace(contentType[idx+len("boundary="):]), `"`)
+	}
+	if boundary == "" {
+		return nil, http.StatusBadRequest, nil, fmt.Errorf("invalid multipart boundary in content-type")
+	}
+
+	mr := multipart.NewReader(bytes.NewReader(reqBody), boundary)
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	modelReplaced := false
+	for {
+		part, err := mr.NextPart()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, http.StatusBadRequest, nil, fmt.Errorf("failed to parse multipart body: %v", err)
+		}
+		data, readErr := io.ReadAll(part)
+		if readErr != nil {
+			return nil, http.StatusBadRequest, nil, fmt.Errorf("failed to read multipart part: %v", readErr)
+		}
+		fieldName := part.FormName()
+		if fieldName == "model" {
+			// 改写 model 字段为路由后的目标模型名
+			if err := mw.WriteField("model", modelID); err != nil {
+				return nil, http.StatusInternalServerError, nil, err
+			}
+			modelReplaced = true
+			continue
+		}
+		// 文件字段保留原 filename/content-type，普通字段原样写回
+		fname := part.FileName()
+		h := make(textproto.MIMEHeader)
+		if fname != "" {
+			h.Set("Content-Disposition", fmt.Sprintf(`form-data; name="%s"; filename="%s"`, escapeMultipartQuotes(fieldName), escapeMultipartQuotes(fname)))
+			if ct := part.Header.Get("Content-Type"); ct != "" {
+				h.Set("Content-Type", ct)
+			}
+			wp, werr := mw.CreatePart(h)
+			if werr != nil {
+				return nil, http.StatusInternalServerError, nil, werr
+			}
+			if _, werr := wp.Write(data); werr != nil {
+				return nil, http.StatusInternalServerError, nil, werr
+			}
+		} else {
+			// 非文件字段：若头部还有除 Content-Disposition 外的自定义头，尽量保留；标准字段直接 WriteField
+			if len(part.Header) > 1 {
+				nh := make(textproto.MIMEHeader)
+				for k, vv := range part.Header {
+					if k == "Content-Disposition" {
+						continue
+					}
+					nh[k] = vv
+				}
+				if len(nh) > 0 {
+					wp, werr := mw.CreatePart(nh)
+					if werr != nil {
+						return nil, http.StatusInternalServerError, nil, werr
+					}
+					if _, werr := wp.Write(data); werr != nil {
+						return nil, http.StatusInternalServerError, nil, werr
+					}
+					continue
+				}
+			}
+			if err := mw.WriteField(fieldName, string(data)); err != nil {
+				return nil, http.StatusInternalServerError, nil, err
+			}
+		}
+	}
+	if !modelReplaced {
+		// 客户端没传 model 字段：直接补上（与 generations 的"必填 model"语义一致）
+		if err := mw.WriteField("model", modelID); err != nil {
+			return nil, http.StatusInternalServerError, nil, err
+		}
+	}
+	if err := mw.Close(); err != nil {
+		return nil, http.StatusInternalServerError, nil, err
+	}
+
+	rebuilt := buf.Bytes()
+	newCT := "multipart/form-data; boundary=" + mw.Boundary()
+	return callPreparedUpstreamEF(ctx, rebuilt, upstreamName, modelID, "images-edit", upstream, proxyAddr, clientHeaders, getUpstreamImagesEditsEndpoint,
+		&bodyFixture{contentType: newCT, buildBody: func() ([]byte, error) {
+			return rebuilt, nil
+		}}, true)
+}
+
+// escapeMultipartQuotes 转义 multipart 字段/文件名中的引号与反斜杠，
+// 避免构造 Content-Disposition 时破坏格式。
+func escapeMultipartQuotes(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	return strings.ReplaceAll(s, `"`, `\"`)
+}
+
+func callUpstream(ctx context.Context, reqBody []byte, upstreamName, modelID, clientAPI string, upstream *UpstreamConfig, proxyAddr string, clientHeaders http.Header, rawResponse ...bool) ([]byte, int, http.Header, error) {
 	tryBody, err := prepareOpenAIUpstreamBody(reqBody, modelID, upstream)
 	if err != nil {
 		return nil, 500, nil, err
 	}
-	return callPreparedUpstream(ctx, tryBody, upstreamName, modelID, clientAPI, upstream, proxyAddr, rawResponse...)
+	return callPreparedUpstream(ctx, tryBody, upstreamName, modelID, clientAPI, upstream, proxyAddr, clientHeaders, rawResponse...)
 }
 
-func callPreparedUpstreamStream(ctx context.Context, preparedBody []byte, upstreamName, modelID, clientAPI string, upstream *UpstreamConfig, proxyAddr string) (io.ReadCloser, int, http.Header, error) {
+func callPreparedUpstreamStream(ctx context.Context, preparedBody []byte, upstreamName, modelID, clientAPI string, upstream *UpstreamConfig, proxyAddr string, clientHeaders http.Header, endpointFn ...func(*UpstreamConfig) string) (io.ReadCloser, int, http.Header, error) {
 	if upstream == nil || upstream.BaseURL == "" {
 		return nil, 500, nil, fmt.Errorf("upstream not configured")
+	}
+
+	epFn := getUpstreamEndpoint
+	if len(endpointFn) > 0 && endpointFn[0] != nil {
+		epFn = endpointFn[0]
 	}
 
 	apiKey, apiKeyIndex, apiKeys := selectUpstreamAPIKey(upstreamName, upstream)
 	retryDelay := 1 * time.Second
 	proxyLabel := modelProxyLabel(proxyAddr)
+	ip := clientIPFromContext(ctx)
 	for {
 		select {
 		case <-ctx.Done():
-			log.Printf("[client disconnect] api=%s upstream=%s model=%s key=%s proxy=%s", clientAPI, effectiveUpstreamName(upstreamName), modelID, formatUpstreamAPIKeySlot(apiKeyIndex, len(apiKeys)), proxyLabel)
+			log.Printf("[client disconnect] api=%s ip=%s upstream=%s model=%s key=%s proxy=%s", clientAPI, ip, effectiveUpstreamName(upstreamName), modelID, formatUpstreamAPIKeySlot(apiKeyIndex, len(apiKeys)), proxyLabel)
 			return nil, 0, nil, ctx.Err()
 		default:
 		}
-		up, err := buildUpstreamRequest(getUpstreamEndpoint(upstream), apiKey, preparedBody, upstream)
+		up, err := buildUpstreamRequest(epFn(upstream), apiKey, preparedBody, upstream, clientHeaders)
 		if err != nil {
 			if err := waitForRetry(ctx, retryDelay); err != nil {
 				return nil, 0, nil, err
@@ -2993,7 +3327,7 @@ func callPreparedUpstreamStream(ctx context.Context, preparedBody []byte, upstre
 			// Refresh upstream config on build error too
 			newUpstreamName, newUpstream := resolveUpstream(upstreamName)
 			if newUpstream == nil || newUpstream.BaseURL == "" {
-				log.Printf("[upstream retry abort] api=%s upstream=%s no longer available, giving up", clientAPI, upstreamName)
+				log.Printf("[upstream retry abort] api=%s ip=%s upstream=%s no longer available, giving up", clientAPI, ip, upstreamName)
 				return nil, 500, nil, fmt.Errorf("upstream %q no longer available", upstreamName)
 			}
 			upstreamName, upstream = newUpstreamName, newUpstream
@@ -3003,7 +3337,7 @@ func callPreparedUpstreamStream(ctx context.Context, preparedBody []byte, upstre
 		}
 		var c *http.Client
 		c, proxyLabel = getModelHTTPClient(proxyAddr, true)
-		log.Printf("[upstream request] api=%s upstream=%s model=%s key=%s proxy=%s", clientAPI, effectiveUpstreamName(upstreamName), modelID, formatUpstreamAPIKeySlot(apiKeyIndex, len(apiKeys)), proxyLabel)
+		log.Printf("[upstream request] api=%s ip=%s upstream=%s model=%s key=%s proxy=%s", clientAPI, ip, effectiveUpstreamName(upstreamName), modelID, formatUpstreamAPIKeySlot(apiKeyIndex, len(apiKeys)), proxyLabel)
 		startTTFB := time.Now()
 		resp, err := c.Do(up)
 		if err != nil {
@@ -3013,7 +3347,7 @@ func callPreparedUpstreamStream(ctx context.Context, preparedBody []byte, upstre
 			// Refresh upstream config on connection error too
 			newUpstreamName, newUpstream := resolveUpstream(upstreamName)
 			if newUpstream == nil || newUpstream.BaseURL == "" {
-				log.Printf("[upstream retry abort] api=%s upstream=%s no longer available, giving up", clientAPI, upstreamName)
+				log.Printf("[upstream retry abort] api=%s ip=%s upstream=%s no longer available, giving up", clientAPI, ip, upstreamName)
 				return nil, 500, nil, fmt.Errorf("upstream %q no longer available", upstreamName)
 			}
 			upstreamName, upstream = newUpstreamName, newUpstream
@@ -3030,13 +3364,14 @@ func callPreparedUpstreamStream(ctx context.Context, preparedBody []byte, upstre
 				clientAPI:  clientAPI,
 				keySlot:    formatUpstreamAPIKeySlot(apiKeyIndex, len(apiKeys)),
 				proxyLabel: proxyLabel,
+				ip:         ip,
 			}
 			return wrappedBody, resp.StatusCode, resp.Header, nil
 		}
 		errBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if shouldRetryUpstreamStatus(resp.StatusCode) {
-			log.Printf("[upstream retry] api=%s upstream=%s model=%s key=%s proxy=%s status=%d retry_after=%q body=%s", clientAPI, effectiveUpstreamName(upstreamName), modelID, formatUpstreamAPIKeySlot(apiKeyIndex, len(apiKeys)), proxyLabel, resp.StatusCode, resp.Header.Get("Retry-After"), string(errBody))
+			log.Printf("[upstream retry] api=%s ip=%s upstream=%s model=%s key=%s proxy=%s status=%d retry_after=%q body=%s", clientAPI, ip, effectiveUpstreamName(upstreamName), modelID, formatUpstreamAPIKeySlot(apiKeyIndex, len(apiKeys)), proxyLabel, resp.StatusCode, resp.Header.Get("Retry-After"), string(errBody))
 			manyKeys := len(apiKeys) > 1
 			if manyKeys {
 				// 多 key：429/5xx 时立即切到下一把 key 轮询，不退避、不等待
@@ -3050,7 +3385,7 @@ func callPreparedUpstreamStream(ctx context.Context, preparedBody []byte, upstre
 			// Refresh upstream config: user may have re-mapped or deleted this upstream
 			newUpstreamName, newUpstream := resolveUpstream(upstreamName)
 			if newUpstream == nil || newUpstream.BaseURL == "" {
-				log.Printf("[upstream retry abort] api=%s upstream=%s no longer available, giving up", clientAPI, upstreamName)
+				log.Printf("[upstream retry abort] api=%s ip=%s upstream=%s no longer available, giving up", clientAPI, ip, upstreamName)
 				return io.NopCloser(bytes.NewReader(errBody)), resp.StatusCode, resp.Header.Clone(), fmt.Errorf("upstream %q no longer available", upstreamName)
 			}
 			upstreamName, upstream = newUpstreamName, newUpstream
@@ -3073,12 +3408,12 @@ func callPreparedUpstreamStream(ctx context.Context, preparedBody []byte, upstre
 	}
 }
 
-func callUpstreamStream(ctx context.Context, reqBody []byte, upstreamName, modelID, clientAPI string, upstream *UpstreamConfig, proxyAddr string) (io.ReadCloser, int, http.Header, error) {
+func callUpstreamStream(ctx context.Context, reqBody []byte, upstreamName, modelID, clientAPI string, upstream *UpstreamConfig, proxyAddr string, clientHeaders http.Header) (io.ReadCloser, int, http.Header, error) {
 	tryBody, err := prepareOpenAIUpstreamBody(reqBody, modelID, upstream)
 	if err != nil {
 		return nil, 500, nil, err
 	}
-	return callPreparedUpstreamStream(ctx, tryBody, upstreamName, modelID, clientAPI, upstream, proxyAddr)
+	return callPreparedUpstreamStream(ctx, tryBody, upstreamName, modelID, clientAPI, upstream, proxyAddr, clientHeaders)
 }
 
 func stripBillingHeaderText(s string) string {
@@ -3621,6 +3956,9 @@ func mapUpstreamErrorBody(body []byte, upstreamType UpstreamType) []byte {
 // ======================== Chat Completions Handler ========================
 
 func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
+	// 解析来源 IP 并注入 context，供下游转发日志复用（Cloudflare 反代取 CF-Connecting-IP）
+	ip := clientIP(r)
+	r = r.WithContext(withClientIP(r.Context(), ip))
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -3634,7 +3972,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 
 	cnt := requestCount.Add(1)
 	if debugMode {
-		log.Printf("[request #%d] POST /v1/chat/completions\n%s", cnt, string(body))
+		log.Printf("[request #%d] POST /v1/chat/completions ip=%s\n%s", cnt, ip, string(body))
 	}
 
 	var req OpenAIRequest
@@ -3674,7 +4012,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 	var toolArgsErr error
 	req.Messages, toolArgsErr = normalizeMessagesToolCallArguments(req.Messages)
 	if toolArgsErr != nil {
-		log.Printf("[request invalid] path=/v1/chat/completions model=%q err=%v", req.Model, toolArgsErr)
+		log.Printf("[request invalid] path=/v1/chat/completions ip=%s model=%q err=%v", ip, req.Model, toolArgsErr)
 		http.Error(w, toolArgsErr.Error(), http.StatusBadRequest)
 		return
 	}
@@ -3683,7 +4021,7 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 	upstreamBody := buildUpstreamBody(&req)
 
 	if req.Stream {
-		upResp, status, upHeader, err := callUpstreamStream(r.Context(), upstreamBody, upstreamName, req.Model, "chat", upstream, modelAliasInfo.Socks5Proxy)
+		upResp, status, upHeader, err := callUpstreamStream(r.Context(), upstreamBody, upstreamName, req.Model, "chat", upstream, modelAliasInfo.Socks5Proxy, r.Header)
 		if err != nil || status < 200 || status >= 300 {
 			w.Header().Set("Content-Type", "application/json")
 			status = applyUpstreamErrorHeaders(w, upHeader, status)
@@ -3714,6 +4052,10 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		reader := bufio.NewReader(upResp)
 		doneSeen := false
+		// 上游（如 opencode 中转）可能在每个 chunk 都带 usage（累积值），
+		// 若逐个累加会把一个流式请求统计成多次。这里只保留最后一次 usage，
+		// 流结束后按最终累积值记一次。
+		var lastUsage map[string]any
 		for {
 			line, err := reader.ReadString('\n')
 			if err != nil {
@@ -3742,27 +4084,12 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 			}
 
 			out, usage := convertStreamChunkWithUsage(line)
+			if usage != nil {
+				lastUsage = usage
+			}
 			if out == "" {
 				// 空choices chunk，但可能有 usage
-				if usage != nil {
-					pt, _ := usage["prompt_tokens"].(float64)
-					ct, _ := usage["completion_tokens"].(float64)
-					tt, _ := usage["total_tokens"].(float64)
-					if tt > 0 {
-						recordTokenUsage(req.Model, int64(pt), int64(ct), int64(tt))
-					}
-				}
 				continue
-			}
-
-			// 提取 usage（已在 convertStreamChunkWithUsage 中解析）
-			if usage != nil && !doneSeen {
-				pt, _ := usage["prompt_tokens"].(float64)
-				ct, _ := usage["completion_tokens"].(float64)
-				tt, _ := usage["total_tokens"].(float64)
-				if tt > 0 {
-					recordTokenUsage(req.Model, int64(pt), int64(ct), int64(tt))
-				}
 			}
 
 			w.Write([]byte(out))
@@ -3771,10 +4098,22 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 				f.Flush()
 			}
 		}
+		// 流结束后按最后一次 usage（上游通常为整轮累积值）记一次统计
+		if lastUsage != nil {
+			pt, _ := lastUsage["prompt_tokens"].(float64)
+			ct, _ := lastUsage["completion_tokens"].(float64)
+			tt, _ := lastUsage["total_tokens"].(float64)
+			if tt == 0 && pt+ct > 0 {
+				tt = pt + ct
+			}
+			if tt > 0 {
+				recordTokenUsage(req.Model, int64(pt), int64(ct), int64(tt))
+			}
+		}
 		return
 	}
 
-	respBody, status, upHeader, err := callUpstream(r.Context(), upstreamBody, upstreamName, req.Model, "chat", upstream, modelAliasInfo.Socks5Proxy)
+	respBody, status, upHeader, err := callUpstream(r.Context(), upstreamBody, upstreamName, req.Model, "chat", upstream, modelAliasInfo.Socks5Proxy, r.Header)
 	if err != nil || status < 200 || status >= 300 {
 		w.Header().Set("Content-Type", "application/json")
 		status = applyUpstreamErrorHeaders(w, upHeader, status)
@@ -3809,6 +4148,178 @@ func chatCompletionsHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	w.Write(outBody)
+}
+
+// ======================== Images Handler ========================
+
+// imagesGenerationsHandler 实现 OpenAI 兼容的 POST /v1/images/generations。
+// 模型名必须命中已配置别名（同 /v1/chat/completions 的校验），请求体仅替换
+// model 字段后透传到上游 /images/generations，响应原样返回。
+// 响应格式（b64_json 或 url）由客户端请求的 response_format 决定，不做改写。
+func imagesGenerationsHandler(w http.ResponseWriter, r *http.Request) {
+	ip := clientIP(r)
+	r = r.WithContext(withClientIP(r.Context(), ip))
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	defer r.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(r.Body, 10*1024*1024))
+	if err != nil {
+		http.Error(w, "Failed to read request body", http.StatusBadRequest)
+		return
+	}
+
+	cnt := requestCount.Add(1)
+	if debugMode {
+		log.Printf("[request #%d] POST /v1/images/generations ip=%s\n%s", cnt, ip, string(body))
+	}
+
+	var req struct {
+		Model string `json:"model"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+	if !isKnownAlias(req.Model) {
+		http.Error(w, `{"error":{"message":"model not found; only configured aliases are accepted","type":"invalid_request_error"}}`, http.StatusBadRequest)
+		return
+	}
+	resolvedModel, modelAliasInfo, upstreamName, upstream := resolveModel(req.Model)
+	req.Model = resolvedModel
+	if req.Model == "" {
+		http.Error(w, `{"error":"model is required"}`, http.StatusBadRequest)
+		return
+	}
+	if upstream == nil || upstream.BaseURL == "" || upstream.APIType != UpstreamOpenAI {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotImplemented)
+		json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{
+			"message": "the upstream for model " + req.Model + " does not support image generation (api_type must be openai)",
+			"type":    "invalid_request_error",
+		}})
+		return
+	}
+
+	respBody, status, upHeader, err := callImagesUpstream(r.Context(), body, upstreamName, req.Model, upstream, modelAliasInfo.Socks5Proxy, r.Header)
+	if err != nil || status < 200 || status >= 300 {
+		w.Header().Set("Content-Type", "application/json")
+		status = applyUpstreamErrorHeaders(w, upHeader, status)
+		w.WriteHeader(status)
+		if len(respBody) > 0 {
+			w.Write(respBody)
+		} else {
+			json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": "upstream error", "type": "upstream_error"}})
+		}
+		return
+	}
+	copyFilteredResponseHeaders(w.Header(), upHeader)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	w.Write(respBody)
+}
+
+// imagesEditsHandler 实现 OpenAI 兼容的 POST /v1/images/edits（multipart/form-data）。
+// 与 generations 相同：模型名必须命中已配置别名；multipart 内的 model 字段
+// 改写为路由后的目标模型名，image/mask 等文件字段与其余字段原样透传，
+// Content-Type 保留 multipart boundary，响应整体原样返回。
+func imagesEditsHandler(w http.ResponseWriter, r *http.Request) {
+	ip := clientIP(r)
+	r = r.WithContext(withClientIP(r.Context(), ip))
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	defer r.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(r.Body, 30*1024*1024)) // 图片编辑含文件，放宽到 30MB
+	if err != nil {
+		http.Error(w, "Failed to read request body", http.StatusBadRequest)
+		return
+	}
+	contentType := r.Header.Get("Content-Type")
+	if !strings.HasPrefix(strings.ToLower(contentType), "multipart/form-data") {
+		http.Error(w, `{"error":{"message":"Content-Type must be multipart/form-data for /v1/images/edits","type":"invalid_request_error"}}`, http.StatusBadRequest)
+		return
+	}
+
+	cnt := requestCount.Add(1)
+	if debugMode {
+		log.Printf("[request #%d] POST /v1/images/edits ip=%s (multipart, %d bytes, ct=%s)", cnt, ip, len(body), contentType)
+	}
+
+	// 从 multipart 中取 model 字段用于别名路由；body 后续整体交给转发层改写
+	var reqModel string
+	{
+		b := boundaryFromContentType(contentType)
+		if b == "" {
+			http.Error(w, `{"error":{"message":"invalid multipart boundary","type":"invalid_request_error"}}`, http.StatusBadRequest)
+			return
+		}
+		mr := multipart.NewReader(bytes.NewReader(body), b)
+		for {
+			part, perr := mr.NextPart()
+			if perr == io.EOF {
+				break
+			}
+			if perr != nil {
+				http.Error(w, `{"error":{"message":"invalid multipart body","type":"invalid_request_error"}}`, http.StatusBadRequest)
+				return
+			}
+			if part.FormName() == "model" {
+				mb, rerr := io.ReadAll(io.LimitReader(part, 1<<20))
+				if rerr == nil {
+					reqModel = strings.TrimSpace(string(mb))
+				}
+				break
+			}
+		}
+	}
+	if !isKnownAlias(reqModel) {
+		http.Error(w, `{"error":{"message":"model not found; only configured aliases are accepted","type":"invalid_request_error"}}`, http.StatusBadRequest)
+		return
+	}
+	resolvedModel, modelAliasInfo, upstreamName, upstream := resolveModel(reqModel)
+	if resolvedModel == "" {
+		http.Error(w, `{"error":"model is required"}`, http.StatusBadRequest)
+		return
+	}
+	if upstream == nil || upstream.BaseURL == "" || upstream.APIType != UpstreamOpenAI {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotImplemented)
+		json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{
+			"message": "the upstream for model " + reqModel + " does not support image editing (api_type must be openai)",
+			"type":    "invalid_request_error",
+		}})
+		return
+	}
+
+	respBody, status, upHeader, err := callImagesEditsUpstream(r.Context(), body, contentType, upstreamName, resolvedModel, upstream, modelAliasInfo.Socks5Proxy, r.Header)
+	if err != nil || status < 200 || status >= 300 {
+		w.Header().Set("Content-Type", "application/json")
+		status = applyUpstreamErrorHeaders(w, upHeader, status)
+		w.WriteHeader(status)
+		if len(respBody) > 0 {
+			w.Write(respBody)
+		} else {
+			json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{"message": "upstream error", "type": "upstream_error"}})
+		}
+		return
+	}
+	copyFilteredResponseHeaders(w.Header(), upHeader)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	w.Write(respBody)
+}
+
+// boundaryFromContentType 解析 Content-Type 头中的 multipart boundary。
+func boundaryFromContentType(contentType string) string {
+	low := strings.ToLower(contentType)
+	idx := strings.Index(low, "boundary=")
+	if idx < 0 {
+		return ""
+	}
+	return strings.Trim(strings.TrimSpace(contentType[idx+len("boundary="):]), `"`)
 }
 
 // ======================== Models Handler ========================
@@ -4261,6 +4772,8 @@ func getFloat(m map[string]any, keys ...string) (float64, bool) {
 }
 
 func anthropicMessagesHandler(w http.ResponseWriter, r *http.Request) {
+	ip := clientIP(r)
+	r = r.WithContext(withClientIP(r.Context(), ip))
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -4274,7 +4787,7 @@ func anthropicMessagesHandler(w http.ResponseWriter, r *http.Request) {
 
 	cnt := requestCount.Add(1)
 	if debugMode {
-		log.Printf("[request #%d] POST /v1/messages\n%s", cnt, string(body))
+		log.Printf("[request #%d] POST /v1/messages ip=%s\n%s", cnt, ip, string(body))
 	}
 
 	var anthropicReq AnthropicRequest
@@ -4295,14 +4808,14 @@ func anthropicMessagesHandler(w http.ResponseWriter, r *http.Request) {
 	if upstream != nil && upstream.APIType == UpstreamAnthropic {
 		rawBody, err := prepareAnthropicPassthroughBody(body, anthropicReq.Model)
 		if err != nil {
-			log.Printf("[request invalid] path=/v1/messages mode=passthrough model=%q err=%v", anthropicReq.Model, err)
+			log.Printf("[request invalid] path=/v1/messages mode=passthrough ip=%s model=%q err=%v", ip, anthropicReq.Model, err)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadRequest)
 			json.NewEncoder(w).Encode(map[string]any{"type": "error", "error": map[string]string{"type": "invalid_request_error", "message": err.Error()}})
 			return
 		}
 		if anthropicReq.Stream {
-			upResp, status, upHeader, err := callPreparedUpstreamStream(r.Context(), rawBody, upstreamName, anthropicReq.Model, "messages", upstream, modelAliasInfo.Socks5Proxy)
+			upResp, status, upHeader, err := callPreparedUpstreamStream(r.Context(), rawBody, upstreamName, anthropicReq.Model, "messages", upstream, modelAliasInfo.Socks5Proxy, r.Header)
 			if err != nil || status < 200 || status >= 300 {
 				errResp := map[string]any{
 					"type":  "error",
@@ -4332,7 +4845,7 @@ func anthropicMessagesHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		respBody, status, upHeader, err := callPreparedUpstream(r.Context(), rawBody, upstreamName, anthropicReq.Model, "messages", upstream, modelAliasInfo.Socks5Proxy, true)
+		respBody, status, upHeader, err := callPreparedUpstream(r.Context(), rawBody, upstreamName, anthropicReq.Model, "messages", upstream, modelAliasInfo.Socks5Proxy, r.Header, true)
 		if err != nil || status < 200 || status >= 300 {
 			w.Header().Set("Content-Type", "application/json")
 			status = applyUpstreamErrorHeaders(w, upHeader, status)
@@ -4359,7 +4872,7 @@ func anthropicMessagesHandler(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		if debugMode {
-			log.Printf("[client response] (Anthropic passthrough)\n%s", string(respBody))
+			log.Printf("[client response] (Anthropic passthrough) ip=%s\n%s", ip, string(respBody))
 		}
 		w.Write(respBody)
 		return
@@ -4388,7 +4901,7 @@ func anthropicMessagesHandler(w http.ResponseWriter, r *http.Request) {
 	var toolArgsErr error
 	messages, toolArgsErr = normalizeMessagesToolCallArguments(messages)
 	if toolArgsErr != nil {
-		log.Printf("[request invalid] path=/v1/messages model=%q err=%v", anthropicReq.Model, toolArgsErr)
+		log.Printf("[request invalid] path=/v1/messages ip=%s model=%q err=%v", ip, anthropicReq.Model, toolArgsErr)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]any{"type": "error", "error": map[string]string{"type": "invalid_request_error", "message": toolArgsErr.Error()}})
@@ -4424,7 +4937,7 @@ func anthropicMessagesHandler(w http.ResponseWriter, r *http.Request) {
 	upstreamBody := buildUpstreamBody(&chatReq)
 
 	if anthropicReq.Stream {
-		upResp, status, upHeader, err := callUpstreamStream(r.Context(), upstreamBody, upstreamName, chatReq.Model, "messages", upstream, modelAliasInfo.Socks5Proxy)
+		upResp, status, upHeader, err := callUpstreamStream(r.Context(), upstreamBody, upstreamName, chatReq.Model, "messages", upstream, modelAliasInfo.Socks5Proxy, r.Header)
 		if err != nil || status < 200 || status >= 300 {
 			errResp := map[string]any{
 				"type":  "error",
@@ -4458,7 +4971,7 @@ func anthropicMessagesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respBody, status, upHeader, err := callUpstream(r.Context(), upstreamBody, upstreamName, chatReq.Model, "messages", upstream, modelAliasInfo.Socks5Proxy)
+	respBody, status, upHeader, err := callUpstream(r.Context(), upstreamBody, upstreamName, chatReq.Model, "messages", upstream, modelAliasInfo.Socks5Proxy, r.Header)
 	if err != nil || status < 200 || status >= 300 {
 		w.Header().Set("Content-Type", "application/json")
 		status = applyUpstreamErrorHeaders(w, upHeader, status)
@@ -4495,7 +5008,7 @@ func anthropicMessagesHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	if debugMode {
-		log.Printf("[client response]\n%s", string(anthropicRespBody))
+		log.Printf("[client response] ip=%s\n%s", ip, string(anthropicRespBody))
 	}
 	w.Write(anthropicRespBody)
 }
@@ -5788,6 +6301,8 @@ func extractTextFromContentParts(content any) string {
 }
 
 func responsesHandler(w http.ResponseWriter, r *http.Request) {
+	ip := clientIP(r)
+	r = r.WithContext(withClientIP(r.Context(), ip))
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -5801,7 +6316,7 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 
 	cnt := requestCount.Add(1)
 	if debugMode {
-		log.Printf("[request #%d] POST /v1/responses\n%s", cnt, string(body))
+		log.Printf("[request #%d] POST /v1/responses ip=%s\n%s", cnt, ip, string(body))
 	}
 
 	var respReq ResponsesAPIRequest
@@ -5824,12 +6339,12 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 	if upstream != nil && upstream.APIType == UpstreamResponses {
 		rawBody, err := prepareResponsesPassthroughBody(body, respReq.Model, modelAliasInfo)
 		if err != nil {
-			log.Printf("[request invalid] path=/v1/responses mode=passthrough model=%q err=%v", respReq.Model, err)
+			log.Printf("[request invalid] path=/v1/responses mode=passthrough ip=%s model=%q err=%v", ip, respReq.Model, err)
 			http.Error(w, "Invalid JSON", http.StatusBadRequest)
 			return
 		}
 		if respReq.Stream {
-			upResp, status, upHeader, err := callPreparedUpstreamStream(r.Context(), rawBody, upstreamName, respReq.Model, "responses", upstream, modelAliasInfo.Socks5Proxy)
+			upResp, status, upHeader, err := callPreparedUpstreamStream(r.Context(), rawBody, upstreamName, respReq.Model, "responses", upstream, modelAliasInfo.Socks5Proxy, r.Header)
 			if err != nil || status < 200 || status >= 300 {
 				w.Header().Set("Content-Type", "application/json")
 				status = applyUpstreamErrorHeaders(w, upHeader, status)
@@ -5854,7 +6369,7 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		respBody, status, upHeader, err := callPreparedUpstream(r.Context(), rawBody, upstreamName, respReq.Model, "responses", upstream, modelAliasInfo.Socks5Proxy, true)
+		respBody, status, upHeader, err := callPreparedUpstream(r.Context(), rawBody, upstreamName, respReq.Model, "responses", upstream, modelAliasInfo.Socks5Proxy, r.Header, true)
 		if err != nil || status < 200 || status >= 300 {
 			w.Header().Set("Content-Type", "application/json")
 			status = applyUpstreamErrorHeaders(w, upHeader, status)
@@ -5948,7 +6463,7 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 	chatReq.Messages = fixToolCallGaps(chatReq.Messages)
 	chatReq.Messages, err = normalizeMessagesToolCallArguments(chatReq.Messages)
 	if err != nil {
-		log.Printf("[request invalid] path=/v1/responses model=%q err=%v", chatReq.Model, err)
+		log.Printf("[request invalid] path=/v1/responses ip=%s model=%q err=%v", ip, chatReq.Model, err)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -5960,7 +6475,7 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 	// 不需要在这里手动转换，避免双重转换导致请求体丢失
 	// 流式响应需要特殊处理
 	if respReq.Stream {
-		upResp, status, upHeader, err := callUpstreamStream(r.Context(), upstreamBody, upstreamName, chatReq.Model, "responses", upstream, modelAliasInfo.Socks5Proxy)
+		upResp, status, upHeader, err := callUpstreamStream(r.Context(), upstreamBody, upstreamName, chatReq.Model, "responses", upstream, modelAliasInfo.Socks5Proxy, r.Header)
 		if err != nil || status < 200 || status >= 300 {
 			w.Header().Set("Content-Type", "application/json")
 			status = applyUpstreamErrorHeaders(w, upHeader, status)
@@ -6004,7 +6519,7 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respBody, status, upHeader, err := callUpstream(r.Context(), upstreamBody, upstreamName, chatReq.Model, "responses", upstream, modelAliasInfo.Socks5Proxy)
+	respBody, status, upHeader, err := callUpstream(r.Context(), upstreamBody, upstreamName, chatReq.Model, "responses", upstream, modelAliasInfo.Socks5Proxy, r.Header)
 	if err != nil || status < 200 || status >= 300 {
 		w.Header().Set("Content-Type", "application/json")
 		status = applyUpstreamErrorHeaders(w, upHeader, status)
@@ -7433,6 +7948,8 @@ func main() {
 	}
 	log.Printf("===================")
 	http.HandleFunc("/v1/chat/completions", chatCompletionsHandler)
+	http.HandleFunc("/v1/images/generations", imagesGenerationsHandler)
+	http.HandleFunc("/v1/images/edits", imagesEditsHandler)
 	http.HandleFunc("/v1/responses", responsesHandler)
 	http.HandleFunc("/v1/messages", anthropicMessagesHandler)
 	http.HandleFunc("/v1/models", listModelsHandler)
